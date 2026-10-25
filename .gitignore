@@ -1,0 +1,63 @@
+# LifeGuard 360 .gitignore
+
+# Python & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Secrets and Environment Variables
+.env
+.env.local
+*.pem
+*.key
+*.cert
+service-account*.json
+firebase-credentials*.json
+
+# SQLite local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# IDE & Editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Flutter / Dart
+frontend/lifeguard360/.dart_tool/
+frontend/lifeguard360/.flutter-plugins
+frontend/lifeguard360/.flutter-plugins-dependencies
+frontend/lifeguard360/.packages
+frontend/lifeguard360/build/
+frontend/lifeguard360/android/.gradle/
+frontend/lifeguard360/android/local.properties
+
+
+# Private credentials
+backend/serviceAccountKey.json
+.env
+.env.*
+!.env.example
+
+# Python virtual environment
+.venv/
+__pycache__/
