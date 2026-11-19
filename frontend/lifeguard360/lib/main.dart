@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'core/constants/app_constants.dart';
+import 'core/database/database_service.dart';
+import 'core/database/sync_service.dart';
 import 'core/location/location_service.dart';
 import 'core/network/api_client.dart';
+import 'core/network/network_service.dart';
 import 'core/platform/android_service_bridge.dart';
 import 'core/routes/app_routes.dart';
 import 'core/sensors/sensor_monitoring_service.dart';
@@ -24,6 +27,26 @@ void main() async {
   final locationService = LocationService();
   final sensorService = SensorMonitoringService();
   final androidBridge = AndroidServiceBridge();
+  final databaseService = DatabaseService.instance;
+  final networkService = NetworkService.instance;
+  final syncService = SyncService.instance;
+
+  // Initialize offline SQLite database
+  try {
+    await databaseService.database;
+  } catch (e) {
+    debugPrint('[LifeGuard360] Database initialization notice: $e');
+  }
+
+  // Automatically sync pending records whenever network connectivity is restored
+  networkService.onConnectivityChanged.listen((isOnline) {
+    if (isOnline) {
+      syncService.syncAll(
+        apiClient: apiClient,
+        localStore: localStore,
+      );
+    }
+  });
 
   runApp(
     LifeGuard360App(
@@ -33,6 +56,7 @@ void main() async {
       locationService: locationService,
       sensorService: sensorService,
       androidBridge: androidBridge,
+      databaseService: databaseService,
     ),
   );
 }
@@ -44,6 +68,7 @@ class LifeGuard360App extends StatelessWidget {
   final ILocationService locationService;
   final ISensorMonitoringService sensorService;
   final IAndroidServiceBridge androidBridge;
+  final DatabaseService? databaseService;
 
   const LifeGuard360App({
     super.key,
@@ -53,6 +78,7 @@ class LifeGuard360App extends StatelessWidget {
     required this.locationService,
     required this.sensorService,
     required this.androidBridge,
+    this.databaseService,
   });
 
   @override
@@ -71,6 +97,7 @@ class LifeGuard360App extends StatelessWidget {
             localStore: localStore,
             secureStorage: secureStorage,
             locationService: locationService,
+            databaseService: databaseService,
           ),
         ),
         ChangeNotifierProvider<MonitoringProvider>(
@@ -81,7 +108,10 @@ class LifeGuard360App extends StatelessWidget {
           )..initialize(),
         ),
         ChangeNotifierProvider<CheckInProvider>(
-          create: (_) => CheckInProvider(apiClient: apiClient)..loadActiveCheckIn(),
+          create: (_) => CheckInProvider(
+            apiClient: apiClient,
+            databaseService: databaseService,
+          )..loadActiveCheckIn(),
         ),
       ],
       child: MaterialApp(

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import '../../../core/constants/api_constants.dart';
+import '../../../core/database/database_service.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/storage/local_checkin_store.dart';
 import '../models/checkin_model.dart';
@@ -9,6 +10,7 @@ import '../models/checkin_model.dart';
 class CheckInProvider extends ChangeNotifier {
   final ApiClient _apiClient;
   final ILocalCheckInStore _checkInStore;
+  final DatabaseService? _databaseService;
 
   CheckInModel? _activeCheckIn;
   List<CheckInModel> _history = [];
@@ -22,8 +24,10 @@ class CheckInProvider extends ChangeNotifier {
   CheckInProvider({
     required ApiClient apiClient,
     ILocalCheckInStore? checkInStore,
+    DatabaseService? databaseService,
   })  : _apiClient = apiClient,
-        _checkInStore = checkInStore ?? LocalCheckInStore() {
+        _checkInStore = checkInStore ?? LocalCheckInStore(),
+        _databaseService = databaseService {
     _startTicker();
     checkPendingOperations();
   }
@@ -69,16 +73,56 @@ class CheckInProvider extends ChangeNotifier {
         final data = response.data['data'] as Map<String, dynamic>? ?? response.data;
         if (data['has_active'] == true && data['checkin'] != null) {
           _activeCheckIn = CheckInModel.fromJson(data['checkin'] as Map<String, dynamic>);
+          _persistActiveCheckInLocally(_activeCheckIn!);
         } else {
           _activeCheckIn = null;
         }
       }
     } catch (e) {
-      _errorMessage = 'Failed to load active check-in: $e';
+      // Offline fallback: attempt loading cached check-in from local SQLite
+      try {
+        final cached = await _databaseService?.getActiveCheckIn();
+        if (cached != null) {
+          _activeCheckIn = CheckInModel.fromJson({
+            'id': cached['server_id'],
+            'user_id': cached['user_id'] != null ? int.tryParse(cached['user_id'].toString()) : null,
+            'title': cached['title'],
+            'destination_note': cached['destination_note'],
+            'scheduled_for': cached['scheduled_for'],
+            'grace_period_minutes': cached['grace_period_minutes'],
+            'pre_alert_seconds': cached['pre_alert_seconds'],
+            'status': cached['status'],
+            'has_pin': (cached['has_pin'] == 1),
+          });
+        } else {
+          _errorMessage = 'Failed to load active check-in: $e';
+        }
+      } catch (_) {
+        _errorMessage = 'Failed to load active check-in: $e';
+      }
     } finally {
       _isLoading = false;
       notifyListeners();
     }
+  }
+
+  void _persistActiveCheckInLocally(CheckInModel checkin) {
+    try {
+      _databaseService?.saveCheckIn({
+        if (checkin.id != null) 'server_id': checkin.id,
+        'client_uuid': 'checkin_${checkin.id ?? DateTime.now().millisecondsSinceEpoch}',
+        if (checkin.userId != null) 'user_id': checkin.userId.toString(),
+        'title': checkin.title,
+        if (checkin.destinationNote != null) 'destination_note': checkin.destinationNote,
+        'scheduled_for': checkin.scheduledFor.toIso8601String(),
+        'grace_period_minutes': checkin.gracePeriodMinutes,
+        'pre_alert_seconds': checkin.preAlertSeconds,
+        'status': checkin.status,
+        'has_pin': checkin.hasPin ? 1 : 0,
+        'sync_status': 'synced',
+        'sync_operation': 'NONE',
+      });
+    } catch (_) {}
   }
 
   /// Schedules a new Smart Check-In

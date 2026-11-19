@@ -1,13 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import '../../../core/database/database_service.dart';
 import '../../../core/location/location_models.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/custom_button.dart';
+import '../../auth/providers/auth_provider.dart';
+import '../../contacts/models/emergency_contact_model.dart';
 import '../../monitoring/providers/monitoring_provider.dart';
 
 /// Screen 11 of 16: Live Location Screen.
-/// Real-time GPS coordinate telemetry, accuracy boundaries, and one-tap location sharing.
+/// Real-time GPS coordinate telemetry, accuracy boundaries, and prioritized emergency location sharing.
 class LiveLocationScreen extends StatefulWidget {
   const LiveLocationScreen({super.key});
 
@@ -24,15 +27,287 @@ class _LiveLocationScreenState extends State<LiveLocationScreen> {
     if (mounted) setState(() => _isRefreshing = false);
   }
 
-  void _shareLocation(double lat, double lng, double accuracy) {
-    final locationUrl = 'https://maps.google.com/?q=$lat,$lng';
-    Clipboard.setData(ClipboardData(text: 'LifeGuard 360 Live Location: $locationUrl (Accuracy ±${accuracy.toStringAsFixed(1)}m)'));
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(
-        content: Text('Live location link copied to clipboard for emergency dispatch.'),
-        backgroundColor: AppTheme.safeEmerald,
+  /// Handles location sharing with contact confirmation.
+  /// Rule:
+  /// 1. Prompts user to select which emergency contact receives the live location.
+  /// 2. If the user confirms a contact, location is shared with that contact.
+  /// 3. If the user cancels or does NOT confirm, location automatically falls back
+  ///    to the highest priority contact (Priority #1 Primary Responder).
+  Future<void> _handleLocationShare(double lat, double lng, double accuracy) async {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final userId = authProvider.currentUser?.id.toString();
+    final dbService = DatabaseService.instance;
+
+    List<EmergencyContactModel> contacts = [];
+    try {
+      final rows = await dbService.getContacts(userId: userId);
+      contacts = rows.map((r) => EmergencyContactModel.fromSqlite(r)).toList();
+    } catch (_) {}
+
+    // Fallback if no contacts have been configured yet
+    if (contacts.isEmpty) {
+      _executeShare(lat, lng, accuracy, null);
+      return;
+    }
+
+    // Sort by priority (Priority 1 is highest priority)
+    contacts.sort((a, b) => a.priorityOrder.compareTo(b.priorityOrder));
+    final highestPriorityContact = contacts.first;
+
+    // Contact selection state (pre-selected to Priority #1 contact)
+    EmergencyContactModel selectedContact = highestPriorityContact;
+
+    final confirmedContact = await showModalBottomSheet<EmergencyContactModel>(
+      context: context,
+      backgroundColor: AppTheme.deepSlate,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
+      isScrollControlled: true,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            return SafeArea(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.share_location_rounded, color: AppTheme.emergencyRed, size: 24),
+                        const SizedBox(width: 10),
+                        const Expanded(
+                          child: Text(
+                            'Share Live Location',
+                            style: TextStyle(
+                              fontSize: 17,
+                              fontWeight: FontWeight.bold,
+                              color: AppTheme.textPrimary,
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close_rounded, color: AppTheme.textMuted),
+                          onPressed: () => Navigator.of(ctx).pop(null), // User dismissed -> will fallback to priority #1
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      'Confirm which emergency contact to alert with your live coordinates. If not confirmed, your highest priority contact will automatically receive it.',
+                      style: TextStyle(fontSize: 12, color: AppTheme.textSecondary),
+                    ),
+                    const SizedBox(height: 14),
+                    ConstrainedBox(
+                      constraints: BoxConstraints(
+                        maxHeight: MediaQuery.of(context).size.height * 0.38,
+                      ),
+                      child: ListView.separated(
+                        shrinkWrap: true,
+                        itemCount: contacts.length,
+                        separatorBuilder: (_, __) => const SizedBox(height: 8),
+                        itemBuilder: (context, index) {
+                          final c = contacts[index];
+                          final isSelected = c.clientUuid == selectedContact.clientUuid ||
+                              (c.id != null && c.id == selectedContact.id);
+                          final isHighest = c.clientUuid == highestPriorityContact.clientUuid ||
+                              (c.id != null && c.id == highestPriorityContact.id);
+
+                          return InkWell(
+                            onTap: () {
+                              setModalState(() => selectedContact = c);
+                            },
+                            borderRadius: BorderRadius.circular(10),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                              decoration: BoxDecoration(
+                                color: isSelected
+                                    ? AppTheme.emergencyRed.withOpacity(0.15)
+                                    : AppTheme.slateBorder.withOpacity(0.2),
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(
+                                  color: isSelected ? AppTheme.emergencyRed : AppTheme.slateBorder,
+                                  width: isSelected ? 1.5 : 0.8,
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  CircleAvatar(
+                                    radius: 16,
+                                    backgroundColor: isHighest
+                                        ? AppTheme.emergencyRed
+                                        : AppTheme.slateBorder.withOpacity(0.5),
+                                    child: Text(
+                                      '#${c.priorityOrder}',
+                                      style: TextStyle(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.bold,
+                                        color: isHighest ? Colors.white : AppTheme.textSecondary,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            Flexible(
+                                              child: Text(
+                                                c.contactName,
+                                                style: const TextStyle(
+                                                  fontSize: 14,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: AppTheme.textPrimary,
+                                                ),
+                                                overflow: TextOverflow.ellipsis,
+                                              ),
+                                            ),
+                                            if (isHighest) ...[
+                                              const SizedBox(width: 6),
+                                              Container(
+                                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                                decoration: BoxDecoration(
+                                                  color: AppTheme.emergencyRed.withOpacity(0.2),
+                                                  borderRadius: BorderRadius.circular(4),
+                                                ),
+                                                child: const Text(
+                                                  'PRIORITY #1',
+                                                  style: TextStyle(
+                                                    color: AppTheme.emergencyRedLight,
+                                                    fontSize: 9,
+                                                    fontWeight: FontWeight.bold,
+                                                  ),
+                                                ),
+                                              ),
+                                            ],
+                                          ],
+                                        ),
+                                        Text(
+                                          '${c.relationship} • ${c.phoneNumber}',
+                                          style: const TextStyle(fontSize: 11, color: AppTheme.textSecondary),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  Icon(
+                                    isSelected ? Icons.check_circle_rounded : Icons.radio_button_unchecked_rounded,
+                                    color: isSelected ? AppTheme.emergencyRed : AppTheme.textMuted,
+                                    size: 20,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: OutlinedButton(
+                            style: OutlinedButton.styleFrom(
+                              side: const BorderSide(color: AppTheme.slateBorder),
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                            onPressed: () {
+                              // User opts for automatic highest priority dispatch
+                              Navigator.of(ctx).pop(highestPriorityContact);
+                            },
+                            child: const Text(
+                              'Auto-Share (#1)',
+                              style: TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: ElevatedButton(
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: AppTheme.emergencyRed,
+                              padding: const EdgeInsets.symmetric(vertical: 12),
+                            ),
+                            onPressed: () {
+                              Navigator.of(ctx).pop(selectedContact);
+                            },
+                            child: const Text(
+                              'Confirm & Share',
+                              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
+
+    // If user cancelled / did not confirm, automatically dispatch to highest priority contact
+    final targetContact = confirmedContact ?? highestPriorityContact;
+    _executeShare(lat, lng, accuracy, targetContact);
+  }
+
+  void _executeShare(double lat, double lng, double accuracy, EmergencyContactModel? contact) {
+    final locationUrl = 'https://maps.google.com/?q=$lat,$lng';
+    String dispatchText;
+    String feedbackMessage;
+
+    if (contact != null) {
+      dispatchText = '🚨 LifeGuard 360 Emergency Location Alert 🚨\n'
+          'Recipient: ${contact.contactName} (${contact.relationship})\n'
+          'Live Coordinates: $locationUrl\n'
+          'Accuracy: ±${accuracy.toStringAsFixed(1)}m\n'
+          'Time: ${DateTime.now().toLocal()}';
+
+      feedbackMessage = 'Live location dispatched to ${contact.contactName} (Priority #${contact.priorityOrder})!';
+
+      // Log in SQLite and Firebase audit logs
+      try {
+        final auth = Provider.of<AuthProvider>(context, listen: false);
+        DatabaseService.instance.logActivity(
+          eventType: 'LOCATION_SHARED',
+          action: 'Live location dispatched to ${contact.contactName}',
+          category: 'SOS',
+          details: 'Recipient: ${contact.contactName} (${contact.phoneNumber}, Priority #${contact.priorityOrder}). Link: $locationUrl (±${accuracy.toStringAsFixed(1)}m)',
+          userId: auth.currentUser?.id.toString(),
+        );
+      } catch (_) {}
+    } else {
+      dispatchText = 'LifeGuard 360 Live Location: $locationUrl (Accuracy ±${accuracy.toStringAsFixed(1)}m)';
+      feedbackMessage = 'Live location link copied to clipboard for emergency dispatch.';
+    }
+
+    Clipboard.setData(ClipboardData(text: dispatchText));
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.check_circle_rounded, color: Colors.white, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  feedbackMessage,
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+          backgroundColor: AppTheme.safeEmerald,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
   }
 
   @override
@@ -241,7 +516,7 @@ class _LiveLocationScreenState extends State<LiveLocationScreen> {
                 text: 'Share Emergency Location Link',
                 icon: Icons.share_location_rounded,
                 variant: ButtonVariant.emergency,
-                onPressed: () => _shareLocation(lat, lng, accuracy),
+                onPressed: () => _handleLocationShare(lat, lng, accuracy),
               ),
             ],
           ),

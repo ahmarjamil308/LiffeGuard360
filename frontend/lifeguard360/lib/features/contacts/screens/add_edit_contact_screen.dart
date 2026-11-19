@@ -1,17 +1,28 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import '../../../core/constants/api_constants.dart';
+import '../../../core/database/database_service.dart';
 import '../../../core/network/api_client.dart';
+import '../../../core/network/network_service.dart';
 import '../../../core/storage/secure_storage_service.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/custom_button.dart';
+import '../../auth/providers/auth_provider.dart';
 import '../models/emergency_contact_model.dart';
 
 /// Screen 10 of 16: Add / Edit Contact Screen.
-/// Form for adding or editing a trusted emergency contact with notification channels.
+/// Form for adding or editing a trusted emergency contact with offline persistence & Firebase sync.
 class AddEditContactScreen extends StatefulWidget {
   final EmergencyContactModel? contactToEdit;
+  final ApiClient? apiClient;
+  final DatabaseService? databaseService;
 
-  const AddEditContactScreen({super.key, this.contactToEdit});
+  const AddEditContactScreen({
+    super.key,
+    this.contactToEdit,
+    this.apiClient,
+    this.databaseService,
+  });
 
   @override
   State<AddEditContactScreen> createState() => _AddEditContactScreenState();
@@ -27,6 +38,8 @@ class _AddEditContactScreenState extends State<AddEditContactScreen> {
   late bool _notifySms;
   late bool _notifyPush;
   bool _isLoading = false;
+  late final ApiClient _apiClient;
+  late final DatabaseService _dbService;
 
   final List<String> _relationships = [
     'Spouse',
@@ -41,6 +54,9 @@ class _AddEditContactScreenState extends State<AddEditContactScreen> {
   @override
   void initState() {
     super.initState();
+    _apiClient = widget.apiClient ?? ApiClient(secureStorage: SecureStorageService());
+    _dbService = widget.databaseService ?? DatabaseService.instance;
+
     final c = widget.contactToEdit;
     _nameController = TextEditingController(text: c?.contactName ?? '');
     _phoneController = TextEditingController(text: c?.phoneNumber ?? '');
@@ -59,57 +75,107 @@ class _AddEditContactScreenState extends State<AddEditContactScreen> {
     super.dispose();
   }
 
-  final _apiClient = ApiClient(secureStorage: SecureStorageService());
-
   Future<void> _saveContact() async {
     if (!_formKey.currentState!.validate()) return;
 
     setState(() => _isLoading = true);
 
-    try {
-      final payload = {
-        'name': _nameController.text.trim(),
-        'phone': _phoneController.text.trim(),
-        'email': _emailController.text.trim().isNotEmpty ? _emailController.text.trim() : null,
-        'relationship': _relationship,
-        'priority_tier': _priorityOrder,
-        'notify_sms': _notifySms,
-        'notify_push': _notifyPush,
-      };
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+    final userId = authProvider.currentUser?.id.toString();
+    final isOnline = NetworkService.instance.isOnline;
+    final isEditing = widget.contactToEdit != null;
 
-      final isEditing = widget.contactToEdit != null;
-      if (isEditing && widget.contactToEdit!.id != null) {
-        await _apiClient.put(
-          ApiConstants.contactDetail(widget.contactToEdit!.id!),
-          data: payload,
-        );
-      } else {
-        await _apiClient.post(
-          ApiConstants.contacts,
-          data: payload,
-        );
-      }
+    final clientUuid = widget.contactToEdit?.clientUuid ??
+        (widget.contactToEdit?.id != null ? 'server_${widget.contactToEdit!.id}' : DatabaseService.generateUuid());
+    final serverId = widget.contactToEdit?.id;
 
-      if (mounted) {
-        setState(() => _isLoading = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Emergency contact ${_nameController.text.trim()} saved successfully'),
-            backgroundColor: AppTheme.safeEmerald,
-          ),
-        );
-        Navigator.of(context).pop(true);
+    final payload = {
+      'name': _nameController.text.trim(),
+      'phone': _phoneController.text.trim(),
+      'email': _emailController.text.trim().isNotEmpty ? _emailController.text.trim() : null,
+      'relationship': _relationship,
+      'priority_tier': _priorityOrder,
+      'notify_sms': _notifySms,
+      'notify_push': _notifyPush,
+    };
+
+    // 1. Always save to local SQLite database first
+    final sqliteRow = {
+      if (serverId != null) 'server_id': serverId,
+      'client_uuid': clientUuid,
+      if (userId != null) 'user_id': userId,
+      'name': _nameController.text.trim(),
+      'phone': _phoneController.text.trim(),
+      'email': _emailController.text.trim().isNotEmpty ? _emailController.text.trim() : null,
+      'relationship': _relationship,
+      'priority_tier': _priorityOrder,
+      'notify_sms': _notifySms ? 1 : 0,
+      'notify_push': _notifyPush ? 1 : 0,
+      'notify_call': 0,
+      'is_active': 1,
+      'sync_status': isOnline ? 'synced' : 'pending',
+      'sync_operation': isEditing ? 'UPDATE' : 'CREATE',
+      'created_at': DateTime.now().toUtc().toIso8601String(),
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+    };
+
+    await _dbService.saveContact(sqliteRow);
+
+    // 2. If online, attempt synchronization with Firebase / Backend
+    int? confirmedServerId = serverId;
+    bool syncSucceeded = false;
+
+    if (isOnline) {
+      try {
+        if (isEditing && serverId != null) {
+          final res = await _apiClient.put(
+            ApiConstants.contactDetail(serverId),
+            data: payload,
+          );
+          if (res.statusCode == 200) {
+            syncSucceeded = true;
+            await _dbService.markContactSynced(clientUuid, serverId);
+          }
+        } else {
+          final res = await _apiClient.post(
+            ApiConstants.contacts,
+            data: payload,
+          );
+          if (res.statusCode == 201 && res.data != null) {
+            final raw = res.data as Map<String, dynamic>;
+            final data = (raw['data'] is Map<String, dynamic>)
+                ? raw['data'] as Map<String, dynamic>
+                : raw;
+            final created = data['contact'] as Map<String, dynamic>?;
+            confirmedServerId = created?['id'] as int?;
+            if (confirmedServerId != null) {
+              syncSucceeded = true;
+              await _dbService.markContactSynced(clientUuid, confirmedServerId);
+            }
+          }
+        }
+      } catch (_) {
+        // Network drop during call: mark as pending in SQLite for future automatic retry
+        await _dbService.saveContact({
+          ...sqliteRow,
+          'sync_status': 'pending',
+        });
       }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _isLoading = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to save contact: $e'),
-            backgroundColor: AppTheme.emergencyRed,
-          ),
-        );
-      }
+    }
+
+    if (mounted) {
+      setState(() => _isLoading = false);
+      final message = syncSucceeded
+          ? 'Emergency contact ${_nameController.text.trim()} saved & synced with Firebase.'
+          : 'Emergency contact ${_nameController.text.trim()} saved locally. Will sync with Firebase when online.';
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+          backgroundColor: syncSucceeded ? AppTheme.safeEmerald : Colors.amber.shade800,
+        ),
+      );
+      Navigator.of(context).pop(true);
     }
   }
 
@@ -231,7 +297,7 @@ class _AddEditContactScreenState extends State<AddEditContactScreen> {
                         ),
                         SwitchListTile(
                           contentPadding: EdgeInsets.zero,
-                          title: const Text('Send SMS Distres Alerts',
+                          title: const Text('Send SMS Distress Alerts',
                               style: TextStyle(fontSize: 13, color: AppTheme.textSecondary)),
                           value: _notifySms,
                           activeColor: AppTheme.safeEmerald,

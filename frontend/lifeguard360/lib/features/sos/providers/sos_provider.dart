@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import '../../../core/constants/api_constants.dart';
 import '../../../core/constants/app_constants.dart';
+import '../../../core/database/database_service.dart';
 import '../../../core/location/location_service.dart';
 import '../../../core/network/api_client.dart';
 import '../../../core/storage/local_incident_store.dart';
@@ -14,6 +15,7 @@ class SOSProvider extends ChangeNotifier {
   final ILocalIncidentStore _localStore;
   final ISecureStorage _secureStorage;
   final ILocationService? _locationService;
+  final DatabaseService? _databaseService;
   final Uuid _uuid = const Uuid();
 
   IncidentModel? _activeIncident;
@@ -27,10 +29,12 @@ class SOSProvider extends ChangeNotifier {
     required ILocalIncidentStore localStore,
     required ISecureStorage secureStorage,
     ILocationService? locationService,
+    DatabaseService? databaseService,
   })  : _apiClient = apiClient,
         _localStore = localStore,
         _secureStorage = secureStorage,
-        _locationService = locationService;
+        _locationService = locationService,
+        _databaseService = databaseService;
 
   ISecureStorage get secureStorage => _secureStorage;
   ILocationService? get locationService => _locationService;
@@ -129,6 +133,16 @@ class SOSProvider extends ChangeNotifier {
     // 3. Persist locally to survive app crash or power cutoff
     try {
       await _localStore.enqueueIncident(localIncident.toJson());
+      try {
+        _databaseService?.saveIncident(localIncident.toJson());
+        _databaseService?.logActivity(
+          eventType: 'MANUAL_SOS_TRIGGERED',
+          action: 'Manual SOS button pressed by user',
+          category: 'SOS',
+          details: 'Coordinates: ${lat ?? 0}, ${lng ?? 0}. Queued offline for Firebase synchronization.',
+          syncStatus: 'pending',
+        );
+      } catch (_) {}
       _isPersistedLocally = true;
       _storageError = null;
       await loadQueuedIncidents();

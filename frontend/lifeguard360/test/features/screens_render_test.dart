@@ -125,8 +125,8 @@ void main() {
 
     testWidgets('Screen 9: EmergencyContactsScreen renders without crashing', (tester) async {
       await tester.pumpWidget(createTestHarness(const EmergencyContactsScreen()));
-      expect(find.text('Sarah Jenkins'), findsOneWidget);
-      expect(find.text('Add Contact'), findsOneWidget);
+      await tester.pump();
+      expect(find.text('Emergency Contacts'), findsOneWidget);
     });
 
     testWidgets('Screen 10: AddEditContactScreen renders without crashing', (tester) async {

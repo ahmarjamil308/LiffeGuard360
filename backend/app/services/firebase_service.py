@@ -87,7 +87,7 @@ class FirebaseService:
             logger.info("Firebase sync is running in MOCK / LOCAL mode (FIREBASE_ENABLED=False).")
             return
 
-        # 1. Try Firebase Admin SDK (Cloud Firestore)
+        # 1. Try Firebase Admin SDK (Cloud Firestore via Service Account)
         if cls._credentials_path and os.path.exists(cls._credentials_path):
             try:
                 import firebase_admin
@@ -112,20 +112,26 @@ class FirebaseService:
                 logger.info("Firebase Cloud Firestore initialized successfully with service account.")
                 return
             except ImportError:
-                logger.warning("firebase-admin package not installed. Falling back to Firebase REST API.")
+                logger.warning("firebase-admin package not installed. Falling back to Cloud Firestore REST API.")
             except Exception as e:
                 cls._stats["last_error"] = str(e)
-                logger.error(f"Failed to initialize Firebase Admin SDK: {e}. Falling back to REST API.")
+                logger.warning(f"Failed to initialize Firebase Admin SDK: {e}. Falling back to Cloud Firestore REST API.")
 
-        # 2. Try Firebase Realtime Database REST API if databaseURL is provided
+        # 2. Try Firebase Cloud Firestore REST API (Direct cloud sync via project ID)
+        if cls._project_id:
+            cls._mode = "REST_FIRESTORE"
+            logger.info(f"Firebase Cloud Firestore REST initialized for project: {cls._project_id}")
+            return
+
+        # 3. Try Firebase Realtime Database REST API if databaseURL is provided
         if cls._database_url:
             cls._mode = "REST_RTDB"
             logger.info(f"Firebase REST Realtime Database initialized at: {cls._database_url}")
             return
 
-        # 3. Fallback to Mock
+        # 4. Fallback to Mock
         cls._mode = "MOCK"
-        logger.warning("Firebase credentials or database URL not configured. Operating in safe MOCK mode.")
+        logger.warning("Firebase credentials or project ID not configured. Operating in safe MOCK mode.")
 
     @classmethod
     def sanitize_payload(cls, collection: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -154,6 +160,43 @@ class FirebaseService:
         return clean
 
     @classmethod
+    def _dict_to_firestore_fields(cls, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Converts arbitrary JSON-friendly primitives to Cloud Firestore REST API field schema."""
+        fields = {}
+        for k, v in data.items():
+            if v is None:
+                fields[k] = {"nullValue": None}
+            elif isinstance(v, bool):
+                fields[k] = {"booleanValue": v}
+            elif isinstance(v, int):
+                fields[k] = {"integerValue": str(v)}
+            elif isinstance(v, float):
+                fields[k] = {"doubleValue": float(v)}
+            elif isinstance(v, str):
+                fields[k] = {"stringValue": v}
+            elif isinstance(v, dict):
+                fields[k] = {"mapValue": {"fields": cls._dict_to_firestore_fields(v)}}
+            elif isinstance(v, list):
+                values = []
+                for item in v:
+                    if isinstance(item, dict):
+                        values.append({"mapValue": {"fields": cls._dict_to_firestore_fields(item)}})
+                    elif isinstance(item, bool):
+                        values.append({"booleanValue": item})
+                    elif isinstance(item, int):
+                        values.append({"integerValue": str(item)})
+                    elif isinstance(item, float):
+                        values.append({"doubleValue": float(item)})
+                    elif item is None:
+                        values.append({"nullValue": None})
+                    else:
+                        values.append({"stringValue": str(item)})
+                fields[k] = {"arrayValue": {"values": values}}
+            else:
+                fields[k] = {"stringValue": str(v)}
+        return fields
+
+    @classmethod
     def store_record(cls, collection: str, doc_id: Any, data: Dict[str, Any]) -> bool:
         """
         Stores or updates an authoritative record in Firebase.
@@ -166,6 +209,13 @@ class FirebaseService:
             if cls._mode == "FIRESTORE" and cls._firestore_client:
                 doc_ref = cls._firestore_client.collection(collection).document(doc_id_str)
                 doc_ref.set(payload, merge=True)
+            elif cls._mode == "REST_FIRESTORE" and cls._project_id:
+                import requests
+                fields = cls._dict_to_firestore_fields(payload)
+                url = f"https://firestore.googleapis.com/v1/projects/{cls._project_id}/databases/(default)/documents/{collection}/{doc_id_str}"
+                resp = requests.patch(url, json={"fields": fields}, timeout=8)
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"REST Firestore error {resp.status_code}: {resp.text}")
             elif cls._mode == "REST_RTDB" and cls._database_url:
                 import requests
                 url = f"{cls._database_url.rstrip('/')}/{collection}/{doc_id_str}.json"
@@ -199,6 +249,12 @@ class FirebaseService:
         try:
             if cls._mode == "FIRESTORE" and cls._firestore_client:
                 cls._firestore_client.collection(collection).document(doc_id_str).delete()
+            elif cls._mode == "REST_FIRESTORE" and cls._project_id:
+                import requests
+                url = f"https://firestore.googleapis.com/v1/projects/{cls._project_id}/databases/(default)/documents/{collection}/{doc_id_str}"
+                resp = requests.delete(url, timeout=8)
+                if resp.status_code >= 400 and resp.status_code != 404:
+                    raise RuntimeError(f"REST Firestore delete error {resp.status_code}: {resp.text}")
             elif cls._mode == "REST_RTDB" and cls._database_url:
                 import requests
                 url = f"{cls._database_url.rstrip('/')}/{collection}/{doc_id_str}.json"
