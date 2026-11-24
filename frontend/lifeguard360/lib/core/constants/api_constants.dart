@@ -7,14 +7,14 @@ class ApiConstants {
 
   /// Default API base URL:
   /// - Automatically connects to 127.0.0.1 for Web (Chrome) & Desktop
-  /// - Automatically connects to 10.0.2.2 for Android Emulator
+  /// - Connects to local WiFi host IP (10.161.114.61) for real Android devices
   static String get defaultBaseUrl {
     if (kIsWeb) {
       return 'http://127.0.0.1:5000/api/v1';
     }
     try {
       if (Platform.isAndroid) {
-        return 'http://10.0.2.2:5000/api/v1';
+        return 'http://10.161.114.61:5000/api/v1';
       }
     } catch (_) {}
     return 'http://127.0.0.1:5000/api/v1';

@@ -28,6 +28,12 @@ class AuthProvider extends ChangeNotifier {
   bool get isLoading => _isLoading;
   bool get isInitialized => _isInitialized;
   String? get errorMessage => _errorMessage;
+  ApiClient get apiClient => _apiClient;
+
+  void updateBaseUrl(String newUrl) {
+    _apiClient.updateBaseUrl(newUrl);
+    notifyListeners();
+  }
 
   void clearError() {
     _errorMessage = null;
